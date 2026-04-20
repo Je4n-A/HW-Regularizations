@@ -1,0 +1,799 @@
+---
+title: "Homework - Regularizations"
+author: "Jean Alvarez"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    number-sections: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Part 1: Iowa House Price Data — Lab Walkthrough Replication
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(h2o)
+library(rsample)
+library(yardstick)
+library(skimr)
+library(plotly)
+library(readxl)
+```
+
+## Initiate H2O
+
+```{r}
+#| output: false
+h2o.init()
+h2o.no_progress()
+```
+
+## Load & Prep Iowa Data
+
+Load the Iowa house price data. `SalePrice` is the target variable.
+
+```{r}
+iowa <- read_excel("ml_data/Original_Data.xlsx", skip = 3, na = "NA")
+
+dim(iowa)
+```
+
+Drop fully-empty columns, drop `Id`, relocate the predicted variable to the left:
+
+```{r}
+iowa <- iowa |>
+  select(where(\(x) !all(is.na(x)))) |>
+  select(-Id) |>
+  relocate(SalePrice)
+
+iowa |> glimpse()
+```
+
+## Skim Data
+
+```{r}
+skim(iowa)
+```
+
+### Identify Columns with Too Many NAs
+
+Drop variables with more than 20% missing values:
+
+```{r}
+too_many_NAs <- iowa |>
+  select(where(\(x) sum(is.na(x)) / length(x) > 0.2)) |>
+  colnames()
+
+print(too_many_NAs)
+```
+
+## Convert Character to Factor
+
+H2O treats factor variables as enumerations (`enum`) and handles one-hot encoding internally.
+
+```{r}
+iowa <- iowa |>
+  mutate(across(where(is.character), as.factor))
+
+glimpse(iowa)
+```
+
+## Predicted / Predictor Variables
+
+```{r}
+X <- iowa |>
+  select(-all_of(too_many_NAs)) |>
+  select(-SalePrice) |>
+  colnames()
+
+length(X)
+
+Y <- "SalePrice"
+```
+
+## Sampling Data
+
+Random train / validation / test split (70 / 15 / 15):
+
+```{r}
+set.seed(42)
+split <- initial_validation_split(iowa, prop = c(0.7, 0.15))
+
+train_h2o <- training(split)   |> as.h2o()
+valid_h2o <- validation(split) |> as.h2o()
+test_h2o  <- testing(split)    |> as.h2o()
+
+h2o.describe(train_h2o)
+```
+
+## Hyperparameter Tuning
+
+### Lasso (L1)
+
+For Lasso, `lambda` is the only hyperparameter to tune. Grid search over
+$\lambda \in [0, 500]$ in steps of 5.
+
+```{r}
+#| output: false
+lambda_search <- list(lambda = seq(0, 500, by = 5))
+
+lasso_grid <- h2o.grid(
+  algorithm       = "glm",
+  grid_id         = "lasso_grid",
+  x               = X,
+  y               = Y,
+  training_frame  = train_h2o,
+  validation_frame = valid_h2o,
+  family          = "gaussian",
+  alpha           = 1,          # Lasso
+  standardize     = TRUE,
+  seed            = 42,
+  hyper_params    = lambda_search
+)
+```
+
+Tuning result — best model by $R^2$:
+
+```{r}
+leaderboard_lasso_r2 <- h2o.getGrid(
+  "lasso_grid",
+  sort_by    = "r2",
+  decreasing = TRUE
+)
+
+leaderboard_lasso_r2@summary_table |> as_tibble() |> head(10)
+```
+
+Extract the best Lasso model:
+
+```{r}
+best_lasso_model <- h2o.getModel(leaderboard_lasso_r2@model_ids[[1]])
+best_lasso_model@parameters$lambda
+```
+
+Test-set performance:
+
+```{r}
+h2o.performance(best_lasso_model, newdata = test_h2o)
+```
+
+### Ridge (L2)
+
+To tune a Ridge model, set `alpha = 0` and reuse the same lambda search space.
+
+```{r}
+#| output: false
+ridge_grid <- h2o.grid(
+  algorithm       = "glm",
+  grid_id         = "ridge_grid",
+  x               = X,
+  y               = Y,
+  training_frame  = train_h2o,
+  validation_frame = valid_h2o,
+  family          = "gaussian",
+  alpha           = 0,          # Ridge
+  standardize     = TRUE,
+  seed            = 42,
+  hyper_params    = lambda_search
+)
+```
+
+```{r}
+leaderboard_ridge_r2 <- h2o.getGrid(
+  "ridge_grid",
+  sort_by    = "r2",
+  decreasing = TRUE
+)
+
+best_ridge_model <- h2o.getModel(leaderboard_ridge_r2@model_ids[[1]])
+best_ridge_model@parameters$lambda
+```
+
+```{r}
+h2o.performance(best_ridge_model, newdata = test_h2o)
+```
+
+### Elastic Net (L1 + L2)
+
+Elastic Net mixes Lasso and Ridge. Since we now tune both $\alpha$ and $\lambda$,
+the grid grows quickly — we switch to a **Random Discrete** search capped at 300 models.
+
+```{r}
+#| output: false
+elastic_search <- list(
+  alpha  = seq(0, 1, by = 0.1),      # L1 ratio
+  lambda = seq(0, 500, by = 5)        # penalization
+)
+
+search_list <- list(
+  strategy   = "RandomDiscrete",
+  max_models = 300,
+  seed       = 42
+)
+
+elastic_grid <- h2o.grid(
+  algorithm        = "glm",
+  grid_id          = "elastic_grid",
+  x                = X,
+  y                = Y,
+  training_frame   = train_h2o,
+  validation_frame = valid_h2o,
+  family           = "gaussian",
+  standardize      = TRUE,
+  hyper_params     = elastic_search,
+  search_criteria  = search_list
+)
+```
+
+```{r}
+leaderboard_elastic_r2 <- h2o.getGrid(
+  "elastic_grid",
+  sort_by    = "r2",
+  decreasing = TRUE
+)
+
+best_elastic_model <- h2o.getModel(leaderboard_elastic_r2@model_ids[[1]])
+
+list(
+  alpha  = best_elastic_model@parameters$alpha,
+  lambda = best_elastic_model@parameters$lambda
+)
+```
+
+```{r}
+h2o.performance(best_elastic_model, newdata = test_h2o)
+```
+
+### Baseline OLS (No Regularization)
+
+```{r}
+#| output: false
+plain_ols_model <- h2o.glm(
+  model_id         = "plain_ols_model",
+  x                = X,
+  y                = Y,
+  training_frame   = train_h2o,
+  validation_frame = valid_h2o,
+  family           = "gaussian",
+  lambda           = 0,    # no penalty
+  compute_p_values = FALSE
+)
+```
+
+```{r}
+h2o.performance(plain_ols_model, newdata = test_h2o)
+```
+
+## Model Predictions
+
+Attach predicted columns from every model onto the validation and test frames.
+
+```{r}
+#| output: false
+make_predictions <- function(model_name) {
+  colname <- str_glue("predicted_{model_name}")
+  model   <- get(model_name, envir = .GlobalEnv)
+
+  valid_h2o[colname] <<- h2o.predict(model, valid_h2o)
+  test_h2o[colname]  <<- h2o.predict(model, test_h2o)
+}
+
+walk(
+  c("best_lasso_model", "best_ridge_model",
+    "best_elastic_model", "plain_ols_model"),
+  make_predictions
+)
+```
+
+## Tuning Visualizations
+
+### Ridge — Lambda vs R² (2D)
+
+```{r}
+ridge_summary <- leaderboard_ridge_r2@summary_table |>
+  as_tibble() |>
+  mutate(lambda = as.numeric(lambda),
+         r2     = as.numeric(r2))
+
+ridge_summary |>
+  ggplot(aes(x = lambda, y = r2)) +
+  geom_point(color = "steelblue") +
+  geom_line(color = "steelblue") +
+  theme_bw() +
+  scale_x_continuous(n.breaks = 10) +
+  labs(title = "Ridge: R² vs Lambda",
+       x = "Lambda (penalty)", y = "R²")
+```
+
+### Elastic Net — Lambda × Alpha × R² (3D)
+
+```{r}
+elastic_summary <- leaderboard_elastic_r2@summary_table |>
+  as_tibble() |>
+  mutate(alpha  = as.numeric(alpha),
+         lambda = as.numeric(lambda),
+         r2     = as.numeric(r2))
+
+plot_ly(
+  data = elastic_summary,
+  x = ~lambda, y = ~alpha, z = ~r2,
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 5, color = ~r2,
+                colorscale = "Viridis", opacity = 0.8)
+) |>
+  layout(scene = list(
+    xaxis = list(title = "Lambda (Penalty)"),
+    yaxis = list(title = "Alpha (Mixture)"),
+    zaxis = list(title = "R²")
+  ))
+```
+
+## Prediction Visualizations
+
+Copy predictions and truth back to R for plotting and metric evaluation.
+
+```{r}
+cols <- c("SalePrice",
+          "predicted_best_lasso_model",
+          "predicted_best_ridge_model",
+          "predicted_best_elastic_model",
+          "predicted_plain_ols_model")
+
+valid_r <- as.data.frame(valid_h2o[, cols]) |> as_tibble()
+test_r  <- as.data.frame(test_h2o[,  cols]) |> as_tibble()
+```
+
+### Actual vs Predicted (Validation Set)
+
+```{r}
+valid_r |>
+  pivot_longer(cols = !SalePrice) |>
+  mutate(name = fct_recode(
+    name,
+    Lasso   = "predicted_best_lasso_model",
+    Ridge   = "predicted_best_ridge_model",
+    Elastic = "predicted_best_elastic_model",
+    OLS     = "predicted_plain_ols_model"
+  )) |>
+  ggplot(aes(x = value, y = SalePrice, color = name)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0,
+              color = "red", linetype = "dotted") +
+  facet_grid(cols = vars(name)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "Actual vs Predicted — Validation Set",
+       x = "Predicted", y = "Actual SalePrice")
+```
+
+## Metric Comparisons
+
+Evaluate each model on the held-out **test** set.
+
+```{r}
+my_metric <- metric_set(mae, rmse, mape, rsq_trad)
+
+lasso_metrics <- my_metric(test_r, truth = SalePrice,
+                           estimate = predicted_best_lasso_model) |>
+  mutate(model = "Lasso")
+
+ridge_metrics <- my_metric(test_r, truth = SalePrice,
+                           estimate = predicted_best_ridge_model) |>
+  mutate(model = "Ridge")
+
+elastic_metrics <- my_metric(test_r, truth = SalePrice,
+                             estimate = predicted_best_elastic_model) |>
+  mutate(model = "Elastic Net")
+
+ols_metrics <- my_metric(test_r, truth = SalePrice,
+                         estimate = predicted_plain_ols_model) |>
+  mutate(model = "OLS (Baseline)")
+
+iowa_comparison <- bind_rows(
+  ols_metrics, lasso_metrics, ridge_metrics, elastic_metrics
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+iowa_comparison
+```
+
+### Performance Gain over OLS
+
+```{r}
+ols_rmse <- iowa_comparison |> filter(model == "OLS (Baseline)") |> pull(rmse)
+ols_mae  <- iowa_comparison |> filter(model == "OLS (Baseline)") |> pull(mae)
+
+iowa_comparison |>
+  mutate(
+    rmse_improvement_pct = (ols_rmse - rmse) / ols_rmse * 100,
+    mae_improvement_pct  = (ols_mae  - mae)  / ols_mae  * 100
+  ) |>
+  select(model, rmse, rmse_improvement_pct,
+         mae, mae_improvement_pct, rsq_trad)
+```
+
+## Variable Importance
+
+In linear models, variable importance is the absolute value of each standardized coefficient.
+
+```{r}
+h2o.varimp_plot(best_lasso_model, num_of_features = 20)
+```
+
+```{r}
+# How many variables did Lasso keep vs how many did it shrink to zero?
+varimp_lasso <- h2o.varimp(best_lasso_model) |> as_tibble()
+
+varimp_lasso |>
+  summarise(
+    total_features = n(),
+    features_kept  = sum(coefficients != 0),
+    features_zeroed = sum(coefficients == 0)
+  )
+```
+
+
+# Part 2: MSFT AR(3)X Model with Regularization
+
+From the previous lab, I built an AR(3)X model on MSFT monthly returns using
+Fama-French 3 factors (lag 1–3 of `ret_m`, and lag 2–3 of `mkt_rf`, `smb`, `hml`).
+Here I re-run that baseline OLS and then apply Lasso, Ridge, and Elastic Net
+to see whether regularization improves out-of-sample performance on financial data.
+
+## Libraries
+
+```{r}
+library(tidyquant)
+library(curl)
+```
+
+## Download & Prep MSFT + FF3 Data
+
+```{r}
+msft_prices <- tq_get("MSFT", from = "2012-01-01", to = "2023-01-01")
+
+msft_monthly <- msft_prices |>
+  mutate(ret_d = adjusted / lag(adjusted) - 1) |>
+  mutate(date  = floor_date(date, "month")) |>
+  group_by(symbol, date) |>
+  summarise(ret_m = prod(1 + ret_d, na.rm = TRUE) - 1, .groups = "drop")
+```
+
+```{r}
+ff_url      <- "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_CSV.zip"
+temp_addr   <- tempfile(fileext = ".zip")
+multi_download(ff_url, temp_addr)
+
+ff_factors <- read_csv(temp_addr, skip = 3) |>
+  janitor::clean_names() |>
+  drop_na() |>
+  mutate(
+    date   = ymd(paste0(x1, "01")),
+    mkt_rf = as.numeric(mkt_rf) / 100,
+    smb    = as.numeric(smb)    / 100,
+    hml    = as.numeric(hml)    / 100,
+    rf     = as.numeric(rf)     / 100,
+    x1     = NULL
+  )
+
+msft_monthly <- msft_monthly |>
+  left_join(ff_factors, by = join_by(date)) |>
+  arrange(date)
+```
+
+## Generate Lagged Features (AR(3)X)
+
+```{r}
+msft_monthly <- msft_monthly |>
+  mutate(
+    ret_m_lag1 = lag(ret_m, 1),
+    ret_m_lag2 = lag(ret_m, 2),
+    ret_m_lag3 = lag(ret_m, 3),
+    mkt_rf_lag2 = lag(mkt_rf, 2),
+    mkt_rf_lag3 = lag(mkt_rf, 3),
+    smb_lag2    = lag(smb, 2),
+    smb_lag3    = lag(smb, 3),
+    hml_lag2    = lag(hml, 2),
+    hml_lag3    = lag(hml, 3)
+  ) |>
+  drop_na()
+
+X_msft <- msft_monthly |> select(contains("lag")) |> colnames()
+X_msft
+```
+
+## Temporal Train / Valid / Test Split
+
+Since this is time-series data, we split by **time**, not randomly:
+last 1 year → test, 2 years before that → validation, everything else → train.
+
+```{r}
+msft_monthly <- msft_monthly |> arrange(date)
+
+cutoff_valid <- max(msft_monthly$date) - years(2)
+cutoff_test  <- max(msft_monthly$date) - years(1)
+
+train_msft <- msft_monthly |> filter(date <  cutoff_valid) |> as.h2o()
+valid_msft <- msft_monthly |> filter(date >= cutoff_valid & date < cutoff_test) |> as.h2o()
+test_msft  <- msft_monthly |> filter(date >= cutoff_test)  |> as.h2o()
+```
+
+## Baseline OLS (from previous lab)
+
+```{r}
+#| output: false
+msft_ols <- h2o.glm(
+  model_id         = "msft_ols",
+  x                = X_msft,
+  y                = "ret_m",
+  training_frame   = train_msft,
+  validation_frame = valid_msft,
+  family           = "gaussian",
+  lambda           = 0,
+  standardize      = TRUE
+)
+```
+
+```{r}
+h2o.performance(msft_ols, newdata = test_msft)
+```
+
+## Lasso Tuning
+
+Smaller lambda grid — monthly returns are on a tiny scale (~1% magnitude) so large
+penalties wipe out all signal.
+
+```{r}
+#| output: false
+msft_lambda_search <- list(lambda = seq(0, 0.05, by = 0.001))
+
+msft_lasso_grid <- h2o.grid(
+  algorithm        = "glm",
+  grid_id          = "msft_lasso_grid",
+  x                = X_msft,
+  y                = "ret_m",
+  training_frame   = train_msft,
+  validation_frame = valid_msft,
+  family           = "gaussian",
+  alpha            = 1,
+  standardize      = TRUE,
+  seed             = 42,
+  hyper_params     = msft_lambda_search
+)
+```
+
+```{r}
+msft_lasso_board <- h2o.getGrid("msft_lasso_grid",
+                                sort_by = "r2", decreasing = TRUE)
+
+best_msft_lasso <- h2o.getModel(msft_lasso_board@model_ids[[1]])
+best_msft_lasso@parameters$lambda
+```
+
+## Ridge Tuning
+
+```{r}
+#| output: false
+msft_ridge_grid <- h2o.grid(
+  algorithm        = "glm",
+  grid_id          = "msft_ridge_grid",
+  x                = X_msft,
+  y                = "ret_m",
+  training_frame   = train_msft,
+  validation_frame = valid_msft,
+  family           = "gaussian",
+  alpha            = 0,
+  standardize      = TRUE,
+  seed             = 42,
+  hyper_params     = msft_lambda_search
+)
+```
+
+```{r}
+msft_ridge_board <- h2o.getGrid("msft_ridge_grid",
+                                sort_by = "r2", decreasing = TRUE)
+
+best_msft_ridge <- h2o.getModel(msft_ridge_board@model_ids[[1]])
+best_msft_ridge@parameters$lambda
+```
+
+## Elastic Net Tuning
+
+```{r}
+#| output: false
+msft_elastic_search <- list(
+  alpha  = seq(0, 1, by = 0.1),
+  lambda = seq(0, 0.05, by = 0.001)
+)
+
+msft_elastic_grid <- h2o.grid(
+  algorithm        = "glm",
+  grid_id          = "msft_elastic_grid",
+  x                = X_msft,
+  y                = "ret_m",
+  training_frame   = train_msft,
+  validation_frame = valid_msft,
+  family           = "gaussian",
+  standardize      = TRUE,
+  hyper_params     = msft_elastic_search,
+  search_criteria  = list(strategy = "RandomDiscrete",
+                          max_models = 300,
+                          seed = 42)
+)
+```
+
+```{r}
+msft_elastic_board <- h2o.getGrid("msft_elastic_grid",
+                                  sort_by = "r2", decreasing = TRUE)
+
+best_msft_elastic <- h2o.getModel(msft_elastic_board@model_ids[[1]])
+
+list(
+  alpha  = best_msft_elastic@parameters$alpha,
+  lambda = best_msft_elastic@parameters$lambda
+)
+```
+
+## Attach Predictions to Test Set
+
+```{r}
+#| output: false
+test_msft[["predicted_ols"]]     <- h2o.predict(msft_ols,         test_msft)
+test_msft[["predicted_lasso"]]   <- h2o.predict(best_msft_lasso,   test_msft)
+test_msft[["predicted_ridge"]]   <- h2o.predict(best_msft_ridge,   test_msft)
+test_msft[["predicted_elastic"]] <- h2o.predict(best_msft_elastic, test_msft)
+```
+
+```{r}
+msft_test_r <- as.data.frame(test_msft[, c("date", "ret_m",
+                                           "predicted_ols",
+                                           "predicted_lasso",
+                                           "predicted_ridge",
+                                           "predicted_elastic")]) |>
+  as_tibble()
+
+msft_test_r |> head()
+```
+
+## Tuning Visualization — Ridge (λ vs R²)
+
+```{r}
+msft_ridge_summary <- msft_ridge_board@summary_table |>
+  as_tibble() |>
+  mutate(lambda = as.numeric(lambda),
+         r2     = as.numeric(r2))
+
+msft_ridge_summary |>
+  ggplot(aes(x = lambda, y = r2)) +
+  geom_point(color = "darkgreen") +
+  geom_line(color = "darkgreen") +
+  theme_bw() +
+  labs(title = "MSFT Ridge: R² vs Lambda",
+       x = "Lambda (penalty)", y = "R² (validation)")
+```
+
+## Tuning Visualization — Elastic Net (α × λ × R²)
+
+```{r}
+msft_elastic_summary <- msft_elastic_board@summary_table |>
+  as_tibble() |>
+  mutate(alpha  = as.numeric(alpha),
+         lambda = as.numeric(lambda),
+         r2     = as.numeric(r2))
+
+plot_ly(
+  data = msft_elastic_summary,
+  x = ~lambda, y = ~alpha, z = ~r2,
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 5, color = ~r2,
+                colorscale = "Viridis", opacity = 0.8)
+) |>
+  layout(scene = list(
+    xaxis = list(title = "Lambda (Penalty)"),
+    yaxis = list(title = "Alpha (Mixture)"),
+    zaxis = list(title = "R²")
+  ),
+  title = "MSFT Elastic Net Tuning Surface")
+```
+
+## Actual vs Predicted — MSFT Test Set
+
+```{r}
+msft_test_r |>
+  pivot_longer(cols = starts_with("predicted_"),
+               names_to = "model", values_to = "predicted") |>
+  mutate(model = fct_recode(model,
+                            OLS        = "predicted_ols",
+                            Lasso      = "predicted_lasso",
+                            Ridge      = "predicted_ridge",
+                            `Elastic`  = "predicted_elastic")) |>
+  ggplot(aes(x = predicted, y = ret_m, color = model)) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_abline(slope = 1, intercept = 0,
+              color = "red", linetype = "dotted") +
+  facet_grid(cols = vars(model)) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(title = "MSFT AR(3)X: Actual vs Predicted (Test Set)",
+       x = "Predicted Monthly Return",
+       y = "Actual Monthly Return")
+```
+
+## Metric Comparison — MSFT Models
+
+```{r}
+msft_metric <- metric_set(mae, rmse, rsq_trad)
+
+msft_comparison <- bind_rows(
+  msft_metric(msft_test_r, truth = ret_m, estimate = predicted_ols)     |> mutate(model = "OLS (Baseline)"),
+  msft_metric(msft_test_r, truth = ret_m, estimate = predicted_lasso)   |> mutate(model = "Lasso"),
+  msft_metric(msft_test_r, truth = ret_m, estimate = predicted_ridge)   |> mutate(model = "Ridge"),
+  msft_metric(msft_test_r, truth = ret_m, estimate = predicted_elastic) |> mutate(model = "Elastic Net")
+) |>
+  select(model, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate)
+
+msft_comparison
+```
+
+### Performance Gain Over OLS — MSFT
+
+```{r}
+msft_ols_rmse <- msft_comparison |> filter(model == "OLS (Baseline)") |> pull(rmse)
+msft_ols_mae  <- msft_comparison |> filter(model == "OLS (Baseline)") |> pull(mae)
+
+msft_comparison |>
+  mutate(
+    rmse_improvement_pct = (msft_ols_rmse - rmse) / msft_ols_rmse * 100,
+    mae_improvement_pct  = (msft_ols_mae  - mae)  / msft_ols_mae  * 100
+  ) |>
+  select(model, rmse, rmse_improvement_pct,
+         mae, mae_improvement_pct, rsq_trad)
+```
+
+## Variable Importance — MSFT Lasso
+
+```{r}
+h2o.varimp_plot(best_msft_lasso)
+```
+
+```{r}
+h2o.varimp(best_msft_lasso) |>
+  as_tibble() |>
+  select(variable, relative_importance, scaled_importance,
+         percentage, coefficients, standardized_coefficients)
+```
+
+# Discussion
+
+**Iowa housing data (Part 1).** With 74 features — many of them one-hot-encoded
+categorical levels — this is exactly the high-dimensional setting where
+regularization shines. OLS overfits noisy neighborhood and categorical dummies,
+while Lasso/Ridge/Elastic Net shrink or zero-out those unreliable coefficients.
+The comparison table shows meaningful RMSE and MAE reductions relative to plain
+OLS, and the Lasso variable-importance plot confirms the model automatically
+performs feature selection (several coefficients driven to exactly zero).
+
+**MSFT AR(3)X (Part 2).** Only 9 predictors, and stock returns are famously noisy
+with a low signal-to-noise ratio. Regularization matters here too, but the gains
+are smaller in absolute terms: Lasso typically zeros out several lag terms,
+Ridge keeps all lags but shrinks them, and Elastic Net lands in between. Because
+the best Lasso lambda tends to be very small (monthly returns are ~1% magnitude),
+regularization mostly acts as a safety net against overfitting rather than a
+dramatic accuracy booster. The takeaway that matters for financial forecasting:
+regularization reduces variance of the coefficient estimates — making the model's
+behavior more stable out-of-sample — even when test R² stays low.
+
+```{r}
+#| output: false
+h2o.shutdown(prompt = FALSE)
+```
