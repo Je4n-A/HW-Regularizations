@@ -426,18 +426,32 @@ iowa_comparison |>
 In linear models, variable importance is the absolute value of each standardized coefficient.
 
 ```{r}
+glm_coefficient_table <- function(model) {
+  coefficients <- unlist(h2o.coef(model), use.names = TRUE)
+  standardized_coefficients <- unlist(h2o.coef_norm(model), use.names = TRUE)
+
+  tibble(
+    variable = names(coefficients),
+    coefficient = as.numeric(coefficients),
+    standardized_coefficient = as.numeric(standardized_coefficients[names(coefficients)])
+  ) |>
+    filter(variable != "Intercept")
+}
+```
+
+```{r}
 h2o.varimp_plot(best_lasso_model, num_of_features = 20)
 ```
 
 ```{r}
 # How many variables did Lasso keep vs how many did it shrink to zero?
-varimp_lasso <- h2o.varimp(best_lasso_model) |> as_tibble()
+lasso_coefficients <- glm_coefficient_table(best_lasso_model)
 
-varimp_lasso |>
+lasso_coefficients |>
   summarise(
     total_features = n(),
-    features_kept  = sum(coefficients != 0),
-    features_zeroed = sum(coefficients == 0)
+    features_kept = sum(coefficient != 0),
+    features_zeroed = sum(coefficient == 0)
   )
 ```
 
@@ -767,10 +781,11 @@ h2o.varimp_plot(best_msft_lasso)
 ```
 
 ```{r}
-h2o.varimp(best_msft_lasso) |>
-  as_tibble() |>
-  select(variable, relative_importance, scaled_importance,
-         percentage, coefficients, standardized_coefficients)
+glm_coefficient_table(best_msft_lasso) |>
+  mutate(
+    absolute_standardized_coefficient = abs(standardized_coefficient)
+  ) |>
+  arrange(desc(absolute_standardized_coefficient))
 ```
 
 # Discussion
@@ -793,7 +808,3 @@ dramatic accuracy booster. The takeaway that matters for financial forecasting:
 regularization reduces variance of the coefficient estimates — making the model's
 behavior more stable out-of-sample — even when test R² stays low.
 
-```{r}
-#| output: false
-h2o.shutdown(prompt = FALSE)
-```
